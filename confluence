@@ -1,0 +1,191 @@
+Absolutely! Below is the updated and complete Confluence page that now includes:
+
+Steps to create the IAM role with required permissions and trust policy
+
+Instructions to update the S3 bucket policy
+
+The rest of the Image Builder "Import Image" flow
+
+You can paste this directly into Confluence (let me know if you want wiki or HTML format too).
+
+📘 How to Create a Windows AMI Using “Import Image” in EC2 Image Builder (via VHD)
+This guide explains how to use the Import Image feature in AWS EC2 Image Builder to create a Windows AMI from a VHD/VHDX file stored in S3, without requiring pipelines or image recipes.
+
+🧾 Prerequisites
+Ensure the following:
+
+A generalized (Sysprepped) Windows VHD/VHDX file.
+
+VHD is uploaded to an S3 bucket in the same AWS region.
+
+You have sufficient AWS permissions to use EC2 Image Builder.
+
+An IAM role is available with necessary permissions to import the image from S3.
+
+📂 Step 1: Upload the VHD to Amazon S3
+Create the bucket if not already present:
+
+bash
+Copy
+Edit
+aws s3 mb s3://your-vhd-bucket-name
+Upload the VHD file:
+
+bash
+Copy
+Edit
+aws s3 cp ./your-image.vhd s3://your-vhd-bucket-name/your-image.vhd
+🔐 Step 2: Create the IAM Role for EC2 Image Import
+If you do not already have a role, follow these steps to create one.
+
+📄 Trust Policy
+Create a trust relationship that allows Image Builder to assume the role:
+
+json
+Copy
+Edit
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Principal": {
+        "Service": "imagebuilder.amazonaws.com"
+      },
+      "Action": "sts:AssumeRole"
+    }
+  ]
+}
+You can create the role using the AWS CLI:
+
+bash
+Copy
+Edit
+aws iam create-role \
+  --role-name EC2ImageBuilderImportRole \
+  --assume-role-policy-document file://trust-policy.json
+📄 Permissions Policy
+Attach a policy with the following required actions:
+
+json
+Copy
+Edit
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": [
+        "s3:GetObject",
+        "s3:ListBucket",
+        "ec2:ImportImage",
+        "ec2:RegisterImage",
+        "ec2:DescribeImages",
+        "ec2:DescribeImportImageTasks",
+        "ec2:CreateTags",
+        "ec2:DescribeSnapshots",
+        "ec2:CopySnapshot"
+      ],
+      "Resource": "*"
+    }
+  ]
+}
+Attach it using:
+
+bash
+Copy
+Edit
+aws iam put-role-policy \
+  --role-name EC2ImageBuilderImportRole \
+  --policy-name EC2ImageImportPermissions \
+  --policy-document file://permissions-policy.json
+🔐 Step 3: Update S3 Bucket Policy (Optional but Recommended)
+If the S3 bucket is not public or cross-account, add a policy that allows Image Builder’s role to access the VHD file.
+
+Replace ACCOUNT_ID with your AWS Account ID:
+
+json
+Copy
+Edit
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "AllowImageBuilderAccess",
+      "Effect": "Allow",
+      "Principal": {
+        "AWS": "arn:aws:iam::ACCOUNT_ID:role/EC2ImageBuilderImportRole"
+      },
+      "Action": [
+        "s3:GetObject",
+        "s3:ListBucket"
+      ],
+      "Resource": [
+        "arn:aws:s3:::your-vhd-bucket-name",
+        "arn:aws:s3:::your-vhd-bucket-name/*"
+      ]
+    }
+  ]
+}
+Apply this to your bucket using the console or CLI.
+
+🧱 Step 4: Use “Import Image” in EC2 Image Builder Console
+Go to EC2 Image Builder in the AWS Console.
+
+From the sidebar, go to Images > AMIs.
+
+Click Import Image.
+
+Fill out the form:
+
+S3 URI: s3://your-vhd-bucket-name/your-image.vhd
+
+Format: VHD or VHDX
+
+OS: Match the OS version used in your image (e.g., Windows Server 2019)
+
+IAM Role: Select the role created above (EC2ImageBuilderImportRole)
+
+(Optional) Add tags or AMI name/version
+
+Click Import Image to begin the process.
+
+⏱️ Step 5: Monitor Import Progress
+In the Image Builder > AMIs section, locate the image.
+
+The status will show as Creating or Pending.
+
+Once completed, the status will change to Available, and the AMI will be registered in EC2.
+
+You can also monitor progress with the CLI:
+
+bash
+Copy
+Edit
+aws ec2 describe-import-image-tasks
+🖼️ Step 6: Launch an EC2 Instance
+Go to EC2 > AMIs > Owned by me
+
+Select the newly created AMI
+
+Click Launch Instance
+
+🧽 Cleanup (Optional)
+Remove the VHD file from S3 if no longer needed:
+
+bash
+Copy
+Edit
+aws s3 rm s3://your-vhd-bucket-name/your-image.vhd
+Delete the IAM role if it's no longer required.
+
+✅ Notes
+This import method supports BYOL (Bring Your Own License).
+
+The VHD must be Sysprepped before upload.
+
+VHD format must be compatible with EC2 (no encrypted disks or nested partitions).
+
+No build pipelines, components, or recipes are required for this process.
+
+Let me know if you want this exported in Markdown, HTML, or Confluence Wiki Markup for direct upload.
