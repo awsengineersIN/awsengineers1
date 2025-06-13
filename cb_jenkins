@@ -1,77 +1,56 @@
-stage('Stream CodeBuild Logs in Real-Time') {
+stage('Wait for CodeBuild and Print Logs') {
     steps {
         script {
-            def buildId = env.CODEBUILD_BUILD_ID  // or set manually
+            def buildId = env.CODEBUILD_BUILD_ID  // Or set manually if needed
             if (!buildId) {
                 error "CODEBUILD_BUILD_ID is not set."
             }
 
-            echo "Getting log details for CodeBuild ID: ${buildId}"
+            echo "Waiting for CodeBuild to complete: ${buildId}"
 
-            def logInfoCmd = """
-                aws codebuild batch-get-builds \
-                --ids ${buildId} \
-                --query 'builds[0].logs.[groupName, streamName]' \
-                --output text
-            """
-            def logInfo = sh(script: logInfoCmd, returnStdout: true).trim().split()
+            // Wait for build to finish
+            def status = ""
+            while (true) {
+                status = sh(
+                    script: "aws codebuild batch-get-builds --ids ${buildId} --query 'builds[0].buildStatus' --output text",
+                    returnStdout: true
+                ).trim()
+
+                echo "CodeBuild Status: ${status}"
+
+                if (status in ["SUCCEEDED", "FAILED", "FAULT", "TIMED_OUT", "STOPPED"]) {
+                    break
+                }
+
+                sleep(time: 10, unit: 'SECONDS')
+            }
+
+            // Get log group and stream
+            def logInfo = sh(
+                script: "aws codebuild batch-get-builds --ids ${buildId} --query 'builds[0].logs.[groupName, streamName]' --output text",
+                returnStdout: true
+            ).trim().split()
             def logGroup = logInfo[0]
             def logStream = logInfo[1]
 
-            echo "Log group: ${logGroup}"
-            echo "Log stream: ${logStream}"
+            echo "Fetching logs from: ${logGroup} / ${logStream}"
 
-            def nextToken = ""
-            def buildFinished = false
+            def logs = sh(
+                script: """
+                    aws logs get-log-events \
+                        --log-group-name "${logGroup}" \
+                        --log-stream-name "${logStream}" \
+                        --output text \
+                        --query 'events[*].message'
+                """,
+                returnStdout: true
+            ).trim()
 
-            sleep(time: 10, unit: 'SECONDS') // Give logs time to appear initially
+            echo "===== CodeBuild Logs ====="
+            echo logs
 
-            while (!buildFinished) {
-                def status = sh(script: "aws codebuild batch-get-builds --ids ${buildId} --query 'builds[0].buildStatus' --output text", returnStdout: true).trim()
-                echo "Build status: ${status}"
-
-                // Fetch logs
-                def logCmd = "aws logs get-log-events --log-group-name '${logGroup}' --log-stream-name '${logStream}'"
-                if (nextToken) {
-                    logCmd += " --next-token '${nextToken}'"
-                }
-                logCmd += " --output json"
-
-                def rawOutput = sh(script: logCmd, returnStdout: true).trim()
-                def parsed
-
-                try {
-                    parsed = readJSON text: rawOutput
-                } catch (err) {
-                    echo "Failed to parse log output as JSON. Raw output:\n${rawOutput}"
-                    parsed = [:]
-                }
-
-                def events = parsed?.events ?: []
-
-                if (events.size() == 0) {
-                    echo "No new log events."
-                } else {
-                    for (event in events) {
-                        echo "[CodeBuild] ${event.message.trim()}"
-                    }
-                }
-
-                def newToken = parsed?.nextForwardToken ?: nextToken
-                buildFinished = (status in ["SUCCEEDED", "FAILED", "FAULT", "TIMED_OUT", "STOPPED"])
-
-                if (newToken != nextToken) {
-                    nextToken = newToken
-                } else {
-                    sleep(time: 5, unit: 'SECONDS')
-                }
-
-                if (buildFinished) {
-                    echo "CodeBuild finished with status: ${status}"
-                    if (status != "SUCCEEDED") {
-                        error "CodeBuild failed with status: ${status}"
-                    }
-                }
+            if (status != "SUCCEEDED") {
+                error "CodeBuild failed with status: ${status}"
             }
         }
     }
