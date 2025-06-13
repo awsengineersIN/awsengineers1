@@ -1,0 +1,42 @@
+stage('Check CodeBuild Build Status and Logs') {
+    steps {
+        script {
+            def buildId = env.CODEBUILD_BUILD_ID  // or set it manually
+            if (!buildId) {
+                error "CODEBUILD_BUILD_ID is not set."
+            }
+
+            echo "Checking CodeBuild build: ${buildId}"
+
+            // Get build status
+            def statusCmd = "aws codebuild batch-get-builds --ids ${buildId} --query 'builds[0].buildStatus' --output text"
+            def buildStatus = sh(script: statusCmd, returnStdout: true).trim()
+            echo "Build Status: ${buildStatus}"
+
+            // Get log group and stream name
+            def logInfoCmd = "aws codebuild batch-get-builds --ids ${buildId} --query 'builds[0].logs.[groupName, streamName]' --output text"
+            def logInfo = sh(script: logInfoCmd, returnStdout: true).trim().split()
+            def logGroup = logInfo[0]
+            def logStream = logInfo[1]
+
+            echo "Fetching logs from: ${logGroup} / ${logStream}"
+
+            // Fetch logs from CloudWatch
+            def logsCmd = """
+                aws logs get-log-events \
+                    --log-group-name "${logGroup}" \
+                    --log-stream-name "${logStream}" \
+                    --output text \
+                    --query 'events[*].message'
+            """
+
+            def logs = sh(script: logsCmd, returnStdout: true).trim()
+            echo "===== CodeBuild Logs =====\n${logs}"
+
+            // Optional: mark build failure in Jenkins if CodeBuild failed
+            if (buildStatus != "SUCCEEDED") {
+                error "CodeBuild failed with status: ${buildStatus}"
+            }
+        }
+    }
+}
