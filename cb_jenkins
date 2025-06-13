@@ -1,49 +1,65 @@
 stage('Stream CodeBuild Logs in Real-Time') {
     steps {
         script {
-            def buildId = env.CODEBUILD_BUILD_ID  // Or pass manually
+            def buildId = env.CODEBUILD_BUILD_ID  // or set manually
             if (!buildId) {
                 error "CODEBUILD_BUILD_ID is not set."
             }
 
-            echo "Waiting for CodeBuild build to complete and streaming logs: ${buildId}"
+            echo "Getting log details for CodeBuild ID: ${buildId}"
 
-            // Get log group and stream name
-            def logInfo = sh(
-                script: "aws codebuild batch-get-builds --ids ${buildId} --query 'builds[0].logs.[groupName, streamName]' --output text",
-                returnStdout: true
-            ).trim().split()
+            def logInfoCmd = """
+                aws codebuild batch-get-builds \
+                --ids ${buildId} \
+                --query 'builds[0].logs.[groupName, streamName]' \
+                --output text
+            """
+            def logInfo = sh(script: logInfoCmd, returnStdout: true).trim().split()
             def logGroup = logInfo[0]
             def logStream = logInfo[1]
+
+            echo "Log group: ${logGroup}"
+            echo "Log stream: ${logStream}"
 
             def nextToken = ""
             def buildFinished = false
 
-            while (!buildFinished) {
-                // Fetch current build status
-                def status = sh(
-                    script: "aws codebuild batch-get-builds --ids ${buildId} --query 'builds[0].buildStatus' --output text",
-                    returnStdout: true
-                ).trim()
+            sleep(time: 10, unit: 'SECONDS') // Give logs time to appear initially
 
-                // Get new log events with pagination
+            while (!buildFinished) {
+                def status = sh(script: "aws codebuild batch-get-builds --ids ${buildId} --query 'builds[0].buildStatus' --output text", returnStdout: true).trim()
+                echo "Build status: ${status}"
+
+                // Fetch logs
                 def logCmd = "aws logs get-log-events --log-group-name '${logGroup}' --log-stream-name '${logStream}'"
                 if (nextToken) {
                     logCmd += " --next-token '${nextToken}'"
                 }
                 logCmd += " --output json"
 
-                def result = sh(script: logCmd, returnStdout: true).trim()
-                def parsed = readJSON text: result
+                def rawOutput = sh(script: logCmd, returnStdout: true).trim()
+                def parsed
 
-                parsed.events.each { event ->
-                    echo event.message.trim()
+                try {
+                    parsed = readJSON text: rawOutput
+                } catch (err) {
+                    echo "Failed to parse log output as JSON. Raw output:\n${rawOutput}"
+                    parsed = [:]
                 }
 
-                def newToken = parsed.nextForwardToken
+                def events = parsed?.events ?: []
+
+                if (events.size() == 0) {
+                    echo "No new log events."
+                } else {
+                    for (event in events) {
+                        echo "[CodeBuild] ${event.message.trim()}"
+                    }
+                }
+
+                def newToken = parsed?.nextForwardToken ?: nextToken
                 buildFinished = (status in ["SUCCEEDED", "FAILED", "FAULT", "TIMED_OUT", "STOPPED"])
 
-                // Only update token if new logs appeared
                 if (newToken != nextToken) {
                     nextToken = newToken
                 } else {
@@ -51,7 +67,7 @@ stage('Stream CodeBuild Logs in Real-Time') {
                 }
 
                 if (buildFinished) {
-                    echo "Build finished with status: ${status}"
+                    echo "CodeBuild finished with status: ${status}"
                     if (status != "SUCCEEDED") {
                         error "CodeBuild failed with status: ${status}"
                     }
