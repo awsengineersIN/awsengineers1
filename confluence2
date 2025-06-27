@@ -1,0 +1,137 @@
+📦 [App Name] – VHD to AMI Import Instructions
+This document describes how to import the [App Name] Windows image into AWS as an AMI using EC2 Image Builder’s Import Image feature.
+
+🧾 Overview
+This AMI is built from a pre-configured, Sysprepped Windows image stored as a .vhd file in S3. This guide walks you through the exact steps to recreate the AMI.
+
+📂 VHD File Details
+Parameter	Value
+Application	App Name
+OS Version	Windows Server YYYY
+VHD File Name	appname-base-image.vhd
+S3 Bucket	app-vhd-bucket
+S3 URI	s3://app-vhd-bucket/appname-base-image.vhd
+File Format	vhd
+
+🔐 IAM Role for Import
+You can reuse the role EC2ImageBuilderImportRole (or create a new one) with the following:
+
+Trust Policy
+json
+Copy
+Edit
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Principal": {
+        "Service": "imagebuilder.amazonaws.com"
+      },
+      "Action": "sts:AssumeRole"
+    }
+  ]
+}
+Permissions Policy
+json
+Copy
+Edit
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": [
+        "s3:GetObject",
+        "s3:ListBucket",
+        "ec2:ImportImage",
+        "ec2:RegisterImage",
+        "ec2:DescribeImportImageTasks",
+        "ec2:CreateTags"
+      ],
+      "Resource": "*"
+    }
+  ]
+}
+🪣 S3 Bucket Policy
+Ensure the following S3 bucket policy is applied to allow EC2 Image Builder to access the file:
+
+Replace ACCOUNT_ID with your AWS account ID.
+
+json
+Copy
+Edit
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "AllowImageBuilderRoleAccess",
+      "Effect": "Allow",
+      "Principal": {
+        "AWS": "arn:aws:iam::ACCOUNT_ID:role/EC2ImageBuilderImportRole"
+      },
+      "Action": [
+        "s3:GetObject",
+        "s3:ListBucket"
+      ],
+      "Resource": [
+        "arn:aws:s3:::app-vhd-bucket",
+        "arn:aws:s3:::app-vhd-bucket/appname-base-image.vhd"
+      ]
+    }
+  ]
+}
+🚀 Steps to Import the VHD into an AMI
+Login to AWS Console, go to EC2 Image Builder → Images → AMIs.
+
+Click Import Image.
+
+Fill the import form as follows:
+
+S3 URI: s3://app-vhd-bucket/appname-base-image.vhd
+
+Format: VHD
+
+Operating System: Windows Server YYYY
+
+IAM Role: EC2ImageBuilderImportRole
+
+Add tags like:
+
+Application=AppName
+
+Environment=Dev/QA/Prod
+
+Click Import Image.
+
+⏱️ Monitor Import Progress
+Track status under Image Builder > Images > AMIs.
+
+Import can take 15–30 minutes.
+
+Once status shows Available, the AMI is ready for use.
+
+🧪 Post-Import (Optional)
+Launch a test EC2 instance from the new AMI.
+
+Confirm application services are running.
+
+Tag the AMI appropriately:
+
+AMIType=Base
+
+Owner=TeamName
+
+App=AppName
+
+🧽 Clean-Up (Optional)
+Delete the VHD file if no longer needed:
+
+bash
+Copy
+Edit
+aws s3 rm s3://app-vhd-bucket/appname-base-image.vhd
+📒 Reference
+EC2 Image Builder docs: https://docs.aws.amazon.com/imagebuilder/latest/userguide/what-is-image-builder.html
+
+VM Import/Export: https://docs.aws.amazon.com/vm-import/latest/userguide/vmimport-image-import.html
