@@ -1,0 +1,98 @@
+📘 SOP: Extend Amazon EBS Volume with LVM and XFS – /dev/vg01/lvol04 on /dev/nvme1n1
+🧾 Purpose
+This document outlines the steps to safely extend an Amazon EBS volume that uses LVM with an XFS filesystem. This SOP applies to the volume /dev/nvme1n1, configured as a physical volume for the logical volume /dev/vg01/lvol04 mounted on /data.
+
+✅ Prerequisites
+The size of the EBS volume /dev/nvme1n1 has already been increased via the AWS Console or CLI.
+
+The filesystem on /dev/vg01/lvol04 is XFS.
+
+The volume is mounted at /data.
+
+You have SSH access to the EC2 instance.
+
+🔧 Step-by-Step Instructions
+🔹 Step 1: Connect to the Instance
+bash
+Copy
+Edit
+ssh ec2-user@<INSTANCE_PUBLIC_DNS>
+🔹 Step 2: Confirm the New Size is Detected
+bash
+Copy
+Edit
+lsblk
+Verify that /dev/nvme1n1 reflects the newly increased size.
+
+If it's not reflected:
+
+Run sudo nvme list to verify device status.
+
+If resizing still doesn’t appear, consider a reboot after snapshot backup.
+
+🔹 Step 3: Resize the Physical Volume
+bash
+Copy
+Edit
+sudo pvresize /dev/nvme1n1
+This command tells LVM to recognize the additional space now available on /dev/nvme1n1.
+
+🔹 Step 4: Extend the Logical Volume
+bash
+Copy
+Edit
+sudo lvextend -l +100%FREE /dev/vg01/lvol04
+This allocates all remaining free space in the volume group vg01 to lvol04.
+
+🔹 Step 5: Resize the XFS Filesystem
+bash
+Copy
+Edit
+sudo xfs_growfs /data
+✅ This step must be performed while /data is mounted, and only works with XFS filesystems.
+
+🔍 Verification
+After completion, verify space expansion:
+
+bash
+Copy
+Edit
+df -h /data
+sudo lvs
+sudo vgs
+🛠️ Troubleshooting Tips
+Issue	Resolution
+pvresize fails	Ensure the EBS volume resize was successful and OS reflects the new size.
+xfs_growfs: not an XFS filesystem	Ensure /data is using XFS: df -T /data
+Space doesn’t increase after all steps	Re-run lsblk, pvdisplay, lvdisplay to confirm changes at each layer
+Volume is not mounted	Use `mount
+
+📂 Complete Command Summary
+bash
+Copy
+Edit
+# Connect to the instance
+ssh ec2-user@<INSTANCE_PUBLIC_DNS>
+
+# Check current block devices
+lsblk
+
+# Resize physical volume
+sudo pvresize /dev/nvme1n1
+
+# Extend logical volume
+sudo lvextend -l +100%FREE /dev/vg01/lvol04
+
+# Grow XFS filesystem
+sudo xfs_growfs /data
+
+# Verify
+df -h /data
+sudo lvs
+📝 Notes
+Take an EBS snapshot backup before performing this operation.
+
+These steps are non-disruptive and require no downtime if the volume is not root.
+
+Applicable only for XFS filesystems.
+
