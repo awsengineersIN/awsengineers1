@@ -1,0 +1,694 @@
+Yes, please provide all files
+├── lambda_function.py
+├── util.py
+└── resource_fetchers/
+├── ec2.py
+├── s3.py
+├── lambda_.py
+├── rds.py
+├── dynamodb.py
+├── glue.py
+├── eventbridge.py
+├── stepfunctions.py
+├── securityhub.py
+└── config.py
+
+Also, provide the complete Jenkins details.
+Yes, please provide all files ├── lambda_function.py ├── util.py └── resource_fetchers/ ├── ec2.py ├── s3.py ├── lambda_.py ├── rds.py ├── dynamodb.py ├── glue.py ├── eventbridge.py ├── stepfunctions.py ├── securityhub.py └── config.py Also, provide the complete Jenkins details.
+Certainly! Below are the complete contents of all requested files and the Jenkins pipeline script, ready for you to save and use.
+
+1. lambda_function.py
+Main Lambda handler with enhanced logging, retries, caching, and CSV emailing.
+
+python
+import os
+import csv
+import json
+import importlib
+import tempfile
+from pathlib import Path
+from email import encoders
+from email.mime.base import MIMEBase
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+
+import boto3
+from botocore.config import Config
+from aws_lambda_powertools import Logger, Metrics
+from aws_lambda_powertools.metrics import MetricUnit
+
+from util import assume, account_id_from_name, ou_id_from_name, accounts_in_ou
+
+# Setup Logger and Metrics
+logger = Logger(service="aws-inventory")
+metrics = Metrics(namespace="AWSInventory", service="ResourceInventory")
+
+# Environment variables
+REGIONS     = os.getenv("REGIONS", "us-east-1").split(",")
+SES_REGION  = os.getenv("SES_REGION", "us-east-1")
+SENDER      = os.getenv("SENDER", None)
+MEMBER_ROLE = os.getenv("MEMBER_READ_ROLE", "ResourceReadRole")
+MAX_ATTACHMENT_SIZE_BYTES = 40 * 1024 * 1024  # 40 MB SES size limit safeguard
+
+if not SENDER:
+    logger.error("Missing required environment variable: SENDER")
+    raise Exception("SENDER environment variable is required.")
+
+# Map resource names to fetcher modules
+RES_MAP = {
+    "EC2": "ec2",
+    "S3": "s3",
+    "Lambda": "lambda_",
+    "RDS": "rds",
+    "DynamoDB": "dynamodb",
+    "Glue": "glue",
+    "Eventbridge": "eventbridge",
+    "StepFunctions": "stepfunctions",
+    "SecurityHub": "securityhub",
+    "Config": "config"
+}
+
+def write_csv(rows, headers, path):
+    with open(path, "w", newline="") as fh:
+        writer = csv.writer(fh)
+        writer.writerow(headers)
+        writer.writerows(rows)
+
+def build_email(recipient, attachments):
+    msg = MIMEMultipart()
+    msg["Subject"] = "AWS resource inventory"
+    msg["From"] = SENDER
+    msg["To"] = recipient
+    body = MIMEText("Attached are the requested CSV inventories.")
+    msg.attach(body)
+
+    for name, data in attachments.items():
+        part = MIMEBase("application", "octet-stream")
+        part.set_payload(data)
+        encoders.encode_base64(part)
+        part.add_header("Content-Disposition", f"attachment; filename={name}")
+        msg.attach(part)
+    return msg
+
+def send_email(recipient, msg):
+    ses = boto3.client("ses", region_name=SES_REGION, config=Config(retries={"max_attempts": 3, "mode": "adaptive"}))
+    try:
+        ses.send_raw_email(Source=SENDER, Destinations=[recipient], RawMessage={"Data": msg.as_string()})
+        logger.info(f"Sent email to {recipient}")
+    except Exception as e:
+        logger.error(f"Failed to send email to {recipient}: {e}")
+        raise
+
+@logger.inject_lambda_context(log_event=True)
+@metrics.log_metrics(capture_cold_start_metric=True)
+def lambda_handler(event, context):
+    """
+    Input event (from Jenkins) is expected as JSON:
+    {
+        "scope": "Account" | "OU",
+        "target": "AccountName" or "OUName",
+        "resources": ["EC2","S3","Lambda",...],
+        "email": "user@example.com"
+    }
+    """
+    scope = event.get("scope")
+    target = event.get("target")
+    resources = event.get("resources", [])
+    recipient = event.get("email")
+
+    if not scope or not target or not resources or not recipient:
+        logger.error(f"Invalid input event: {event}")
+        raise ValueError("Input event missing required fields.")
+
+    logger.info(f"Inventory requested for scope={scope}, target={target}, resources={resources}, email={recipient}")
+
+    # Resolve accounts list based on scope
+    try:
+        if scope == "Account":
+            accounts = [account_id_from_name(target)]
+        elif scope == "OU":
+            ou_id = ou_id_from_name(target)
+            accounts = accounts_in_ou(ou_id)
+        else:
+            raise ValueError(f"Invalid scope value: {scope}")
+    except Exception as ex:
+        logger.error(f"Failed resolving accounts: {ex}")
+        raise
+
+    logger.info(f"Resolved accounts: {accounts}")
+
+    tmp_dir = Path(tempfile.gettempdir())
+    attachments = {}
+    total_rows = 0
+    total_bytes = 0
+
+    for acct in accounts:
+        role_arn = f"arn:aws:iam::{acct}:role/{MEMBER_ROLE}"
+        logger.info(f"Assuming role {role_arn}")
+        try:
+            session = assume(role_arn, "inventory-run")
+        except Exception as e:
+            logger.error(f"Failed to assume role for account {acct}: {e}")
+            continue
+
+        for res in resources:
+            mod_name = RES_MAP.get(res)
+            if not mod_name:
+                logger.warning(f"Unknown resource type requested: {res}")
+                continue
+            try:
+                mod = importlib.import_module(f"resource_fetchers.{mod_name}")
+            except ImportError as e:
+                logger.error(f"Failed to import resource fetcher module {mod_name}: {e}")
+                continue
+
+            logger.info(f"Collecting resource {res} data for account {acct}")
+            rows = []
+            try:
+                # For S3 region is irrelevant for bucket listing, force us-east-1 only to avoid errors
+                if res == "S3":
+                    regions = ["us-east-1"]
+                else:
+                    regions = REGIONS
+
+                for region in regions:
+                    rows.extend(mod.collect(session, acct, region))
+
+                if not rows:
+                    logger.info(f"No data found for resource {res} in account {acct}")
+                    continue
+            except Exception as e:
+                logger.error(f"Error collecting {res} for account {acct}: {e}")
+                continue
+
+            # Write CSV
+            csv_name = f"{acct}_{res}.csv"
+            csv_path = tmp_dir / csv_name
+            try:
+                write_csv(rows, mod.HEADERS, csv_path)
+                data_bytes = csv_path.read_bytes()
+
+                # Check attachment size, gzip and store to S3 if oversize
+                if len(data_bytes) > MAX_ATTACHMENT_SIZE_BYTES:
+                    import gzip
+                    import io
+                    logger.warning(f"Attachment {csv_name} size {len(data_bytes)} exceeds SES limit, compressing and uploading to S3")
+                    bucket_name = os.getenv("S3_BUCKET_FOR_OVERSIZE")
+                    if not bucket_name:
+                        logger.error("No S3_BUCKET_FOR_OVERSIZE env var set - cannot upload large files.")
+                        continue
+                    key = f"inventory/{csv_name}.gz"
+                    buf = io.BytesIO()
+                    with gzip.GzipFile(filename=csv_name, mode='wb', fileobj=buf) as gz:
+                        gz.write(data_bytes)
+                    buf.seek(0)
+
+                    s3_client = boto3.client("s3")
+                    s3_client.put_object(Bucket=bucket_name, Key=key, Body=buf.read())
+                    presigner = s3_client.generate_presigned_url(
+                        ClientMethod="get_object",
+                        Params={"Bucket": bucket_name, "Key": key},
+                        ExpiresIn=3600 * 24 * 7  # 7 days
+                    )
+                    # Replace attachment with URL text file
+                    attachments[f"{csv_name}.url.txt"] = presigner.encode("utf-8")
+                    logger.info(f"Uploaded large CSV to s3://{bucket_name}/{key} and added presigned URL attachment")
+                else:
+                    attachments[csv_name] = data_bytes
+                    total_bytes += len(data_bytes)
+                    total_rows += len(rows)
+            except Exception as e:
+                logger.error(f"Failed to prepare CSV for {res} in account {acct}: {e}")
+
+    if not attachments:
+        msg = MIMEText("No data found for the requested resources.")
+        msg["Subject"] = "AWS resource inventory - NO DATA"
+        msg["From"] = SENDER
+        msg["To"] = recipient
+        ses = boto3.client("ses", region_name=SES_REGION)
+        ses.send_raw_email(Source=SENDER, Destinations=[recipient], RawMessage={"Data": msg.as_string()})
+        logger.info(f"Sent NO DATA email to {recipient}")
+        return {"message": "No data found to send."}
+
+    try:
+        email_msg = build_email(recipient, attachments)
+        send_email(recipient, email_msg)
+    except Exception as e:
+        logger.error(f"Failed to send email: {e}")
+        raise
+
+    metrics.add_metric(name="CsvRowCount", unit=MetricUnit.Count, value=total_rows)
+    metrics.add_metric(name="CsvByteCount", unit=MetricUnit.Bytes, value=total_bytes)
+    metrics.publish()
+
+    return {
+        "message": f"Sent {len(attachments)} CSV(s) to {recipient}",
+        "accounts_count": len(accounts),
+        "rows_count": total_rows
+    }
+2. util.py
+Organization and STS helper utilities with caching and adaptive retries.
+
+python
+import os
+from functools import lru_cache
+import boto3
+from botocore.config import Config
+
+# Configure retry strategy for all clients
+CONFIG_STD = Config(
+    retries={
+        "max_attempts": 10,
+        "mode": "adaptive"
+    }
+)
+
+ORG = boto3.client("organizations", config=CONFIG_STD)
+STS = boto3.client("sts", config=CONFIG_STD)
+ROLE_NAME = os.environ.get("MEMBER_READ_ROLE", "ResourceReadRole")
+
+
+def assume(role_arn: str, session_name: str = "inventory") -> boto3.Session:
+    """
+    Assume the given role and return a boto3 Session with temporary credentials
+    """
+    resp = STS.assume_role(RoleArn=role_arn, RoleSessionName=session_name)
+    creds = resp["Credentials"]
+    session = boto3.Session(
+        aws_access_key_id=creds["AccessKeyId"],
+        aws_secret_access_key=creds["SecretAccessKey"],
+        aws_session_token=creds["SessionToken"]
+    )
+    return session
+
+
+@lru_cache(maxsize=None)
+def account_id_from_name(name: str) -> str:
+    paginator = ORG.get_paginator("list_accounts")
+    for page in paginator.paginate():
+        for account in page["Accounts"]:
+            if account["Name"] == name:
+                return account["Id"]
+    raise ValueError(f"Account '{name}' not found")
+
+
+@lru_cache(maxsize=None)
+def ou_id_from_name(name: str, parent_id: str = None) -> str:
+    roots = ORG.list_roots()["Roots"]
+    parents = [parent_id] if parent_id else [r["Id"] for r in roots]
+
+    for pid in parents:
+        paginator = ORG.get_paginator("list_organizational_units_for_parent")
+        for page in paginator.paginate(ParentId=pid):
+            for ou in page["OrganizationalUnits"]:
+                if ou["Name"] == name:
+                    return ou["Id"]
+                else:
+                    # recursive search
+                    try:
+                        return ou_id_from_name(name, ou["Id"])
+                    except ValueError:
+                        continue
+    raise ValueError(f"OU '{name}' not found")
+
+
+@lru_cache(maxsize=None)
+def accounts_in_ou(ou_id: str) -> tuple[str, ...]:
+    accounts = []
+    paginator = ORG.get_paginator("list_accounts_for_parent")
+    for page in paginator.paginate(ParentId=ou_id):
+        accounts.extend([a["Id"] for a in page["Accounts"] if a["Status"] == "ACTIVE"])
+
+    paginator_ou = ORG.get_paginator("list_organizational_units_for_parent")
+    for page in paginator_ou.paginate(ParentId=ou_id):
+        for child_ou in page["OrganizationalUnits"]:
+            accounts.extend(accounts_in_ou(child_ou["Id"]))
+
+    return tuple(accounts)
+3. resource_fetchers/
+Each module exports a HEADERS list and a collect(session, account_id, region) callable returning a list of rows [[]].
+
+3.1 ec2.py
+python
+import boto3
+
+HEADERS = ["InstanceId", "NameTag", "State", "LaunchTime", "Arn"]
+
+def collect(sess, acct, region):
+    ec2 = sess.client("ec2", region_name=region)
+    rows = []
+    paginator = ec2.get_paginator("describe_instances")
+
+    for page in paginator.paginate():
+        for reservation in page.get("Reservations", []):
+            for instance in reservation.get("Instances", []):
+                name = ""
+                for tag in instance.get("Tags", []):
+                    if tag.get("Key") == "Name":
+                        name = tag.get("Value")
+                        break
+                arn = f"arn:aws:ec2:{region}:{acct}:instance/{instance['InstanceId']}"
+                rows.append([
+                    instance["InstanceId"],
+                    name,
+                    instance["State"]["Name"],
+                    instance["LaunchTime"].strftime("%Y-%m-%d"),
+                    arn
+                ])
+    return rows
+3.2 s3.py
+python
+import boto3
+
+HEADERS = ["Bucket", "Region", "CreationDate", "Arn"]
+
+def collect(sess, acct, _):
+    s3 = sess.client("s3")
+    rows = []
+    buckets = s3.list_buckets().get("Buckets", [])
+    for bucket in buckets:
+        name = bucket["Name"]
+        creation_date = bucket["CreationDate"].strftime("%Y-%m-%d")
+        try:
+            loc = s3.get_bucket_location(Bucket=name).get("LocationConstraint")
+            if loc is None:
+                loc = "us-east-1"
+        except Exception:
+            loc = "unknown"
+        arn = f"arn:aws:s3:::{name}"
+        rows.append([name, loc, creation_date, arn])
+    return rows
+3.3 lambda_.py
+python
+import boto3
+
+HEADERS = ["Function", "Runtime", "LastModified", "Region", "Arn"]
+
+def collect(sess, acct, region):
+    lam = sess.client("lambda", region_name=region)
+    rows = []
+    paginator = lam.get_paginator("list_functions")
+    for page in paginator.paginate():
+        for fn in page.get("Functions", []):
+            rows.append([
+                fn["FunctionName"],
+                fn.get("Runtime", ""),
+                fn["LastModified"].split("T")[0],
+                region,
+                fn["FunctionArn"]
+            ])
+    return rows
+3.4 rds.py
+python
+import boto3
+
+HEADERS = ["DBInstanceId", "Engine", "Status", "Region", "Arn", "Created"]
+
+def collect(sess, acct, region):
+    rds = sess.client("rds", region_name=region)
+    rows = []
+    paginator = rds.get_paginator("describe_db_instances")
+    for page in paginator.paginate():
+        for db in page.get("DBInstances", []):
+            rows.append([
+                db["DBInstanceIdentifier"],
+                db["Engine"],
+                db["DBInstanceStatus"],
+                region,
+                db["DBInstanceArn"],
+                db["InstanceCreateTime"].date().isoformat()
+            ])
+    return rows
+3.5 dynamodb.py
+python
+import boto3
+
+HEADERS = ["Table", "Status", "Region", "Arn", "CreationDate"]
+
+def collect(sess, acct, region):
+    ddb = sess.client("dynamodb", region_name=region)
+    rows = []
+    paginator = ddb.get_paginator("list_tables")
+    for page in paginator.paginate():
+        for table in page.get("TableNames", []):
+            meta = ddb.describe_table(TableName=table)["Table"]
+            rows.append([
+                table,
+                meta["TableStatus"],
+                region,
+                meta["TableArn"],
+                meta["CreationDateTime"].date().isoformat()
+            ])
+    return rows
+3.6 glue.py
+python
+import boto3
+
+HEADERS = ["Job", "GlueVersion", "CreatedOn", "Region", "Arn"]
+
+def collect(sess, acct, region):
+    glue = sess.client("glue", region_name=region)
+    rows = []
+    paginator = glue.get_paginator("get_jobs")
+    for page in paginator.paginate():
+        for job in page.get("Jobs", []):
+            rows.append([
+                job["Name"],
+                job.get("GlueVersion", ""),
+                job["CreatedOn"].date().isoformat(),
+                region,
+                job.get("Role", "")
+            ])
+    return rows
+3.7 eventbridge.py
+python
+import boto3
+
+HEADERS = ["Rule", "State", "Schedule", "Region", "Arn"]
+
+def collect(sess, acct, region):
+    events = sess.client("events", region_name=region)
+    rows = []
+    paginator = events.get_paginator("list_rules")
+    for page in paginator.paginate():
+        for rule in page.get("Rules", []):
+            rows.append([
+                rule["Name"],
+                rule["State"],
+                rule.get("ScheduleExpression", ""),
+                region,
+                rule["Arn"]
+            ])
+    return rows
+3.8 stepfunctions.py
+python
+import boto3
+
+HEADERS = ["StateMachine", "Type", "Region", "Arn", "Created"]
+
+def collect(sess, acct, region):
+    sfn = sess.client("stepfunctions", region_name=region)
+    rows = []
+    paginator = sfn.get_paginator("list_state_machines")
+    for page in paginator.paginate():
+        for sm in page.get("stateMachines", []):
+            rows.append([
+                sm["name"],
+                sm["type"],
+                region,
+                sm["stateMachineArn"],
+                sm["creationDate"].date().isoformat()
+            ])
+    return rows
+3.9 securityhub.py
+python
+import boto3
+
+HEADERS = [
+    "FindingId", "Account", "Product", "SeverityLabel",
+    "ResourceType", "ResourceId", "Title", "CreatedAt", "UpdatedAt"
+]
+
+def collect(sess, *_):
+    sh = sess.client("securityhub")
+    rows = []
+    paginator = sh.get_paginator("get_findings")
+    for page in paginator.paginate(
+        Filters={"RecordState":[{"Value":"ACTIVE","Comparison":"EQUALS"}]},
+        PaginationConfig={"PageSize": 100}
+    ):
+        for finding in page.get("Findings", []):
+            if not finding["Resources"]:
+                continue
+            primary = finding["Resources"][0]
+            rows.append([
+                finding["Id"],
+                finding["AwsAccountId"],
+                finding["ProductArn"].split(":")[5],
+                finding["Severity"]["Label"],
+                primary["Type"],
+                primary["Id"],
+                finding["Title"],
+                finding["CreatedAt"][:19],
+                finding["UpdatedAt"][:19]
+            ])
+    return rows
+3.10 config.py
+python
+import boto3
+import datetime
+
+HEADERS = ["ResourceType", "ResourceId", "ResourceName", "DiscoveredTime"]
+
+RESOURCE_TYPES = [
+    "AWS::EC2::VPC",
+    # add more resource types as needed
+]
+
+def collect(sess, acct, region):
+    cfg = sess.client("config", region_name=region)
+    rows = []
+    for rtype in RESOURCE_TYPES:
+        paginator = cfg.get_paginator("list_discovered_resources")
+        for page in paginator.paginate(resourceType=rtype, limit=1000):
+            for rid in page.get("resourceIdentifiers", []):
+                rows.append([
+                    rid["resourceType"],
+                    rid["resourceId"],
+                    rid.get("resourceName", ""),
+                    datetime.datetime.utcnow().date().isoformat()
+                ])
+    return rows
+4. Complete Jenkins Pipeline (Jenkinsfile with inline boto3 calls via embedded Python)
+groovy
+pipeline {
+  agent any
+
+  parameters {
+    choice(
+      name: 'SCOPE',
+      choices: ['Account', 'OU'],
+      description: 'Inventory a single account or an entire OU'
+    )
+
+    // TARGET parameter dynamically lists accounts or OUs based on SCOPE
+    [$class: 'CascadeChoiceParameter',
+      choiceType: 'PT_SINGLE_SELECT',
+      name: 'TARGET',
+      referencedParameters: 'SCOPE',
+      script: [$class: 'GroovyScript',
+        sandbox: true,
+        script: '''
+          import groovy.json.JsonSlurper
+
+          def py = """
+import boto3, os, json, sys
+role_arn = os.environ['ROLE_ARN']
+ext_id = os.getenv('EXTERNAL_ID')
+sts = boto3.client('sts')
+kwargs = dict(RoleArn=role_arn, RoleSessionName='jenkins-ac')
+if ext_id:
+    kwargs['ExternalId'] = ext_id
+creds = sts.assume_role(**kwargs)['Credentials']
+org = boto3.client(
+    'organizations',
+    aws_access_key_id=creds['AccessKeyId'],
+    aws_secret_access_key=creds['SecretAccessKey'],
+    aws_session_token=creds['SessionToken']
+)
+mode = sys.argv[1]
+items = []
+if mode == 'accounts':
+    paginator = org.get_paginator('list_accounts')
+    for page in paginator.paginate():
+        items.extend([a['Name'] for a in page['Accounts'] if a['Status'] == 'ACTIVE'])
+else:
+    roots = org.list_roots()['Roots']
+    for r in roots:
+        ous = org.list_organizational_units_for_parent(ParentId=r['Id'])['OrganizationalUnits']
+        items.extend([ou['Name'] for ou in ous])
+print(json.dumps(sorted(items)))
+          """.stripIndent()
+
+          def mode = (SCOPE == 'Account') ? 'accounts' : 'ous'
+          def cmd = ['python3', '-c', py, mode]
+          def pb = new ProcessBuilder(cmd)
+          pb.environment().putAll([
+            'ROLE_ARN': 'arn:aws:iam::123456789012:role/readonlyrole',  // Replace with your role ARN
+            'EXTERNAL_ID': 'my-external-id'                            // Remove or insert your external ID if not used
+          ])
+          def proc = pb.redirectErrorStream(true).start()
+          proc.waitFor()
+          def output = proc.inputStream.text
+          return new JsonSlurper().parseText(output)
+        '''
+      ]
+    ]
+
+    choice(
+      name: 'RESOURCES',
+      choices: [
+        'EC2', 'S3', 'Lambda', 'RDS', 'DynamoDB', 'Glue',
+        'Eventbridge', 'StepFunctions', 'SecurityHub', 'Config'
+      ].join('\n'),
+      description: 'AWS services or posture data to inventory',
+      multiple: true
+    )
+
+    string(
+      name: 'EMAIL',
+      defaultValue: 'me@example.com',
+      description: 'Recipient email address'
+    )
+  }
+
+  environment {
+    LAMBDA_ARN = 'arn:aws:lambda:us-east-1:123456789012:function:inventory' // replace
+  }
+
+  stages {
+    stage('Invoke Lambda') {
+      steps {
+        script {
+          def payload = [
+            scope: params.SCOPE,
+            target: params.TARGET,
+            resources: params.RESOURCES.tokenize(','),
+            email: params.EMAIL
+          ]
+          sh """
+            aws lambda invoke \
+              --function-name $LAMBDA_ARN \
+              --payload '${groovy.json.JsonOutput.toJson(payload)}' \
+              --cli-binary-format raw-in-base64-out \
+              response.json
+          """
+          echo readFile('response.json')
+        }
+      }
+    }
+  }
+}
+Notes for Jenkins setup
+Replace the ROLE_ARN in the groovy python inline snippet with your actual read-only role ARN.
+
+Provide EXTERNAL_ID only if your role requires it.
+
+Ensure the Jenkins master node has Python 3 and boto3 installed.
+
+The Active Choices plugin must be installed for dynamic parameters.
+
+Summary
+You now have:
+
+Lambda source with caching, logging, retries, and SES upload for large files
+
+Util.py with AWS Organizations helpers using LRU cache
+
+Resource fetcher modules for all requested AWS resources and posture services
+
+Jenkins Pipeline script fully inline, dynamically fetching parameters via embedded Python boto3 calls
+
+If you want, I can provide any file separately for easier copy-pasting or help with deployment instructions.
+
+Let me know!
