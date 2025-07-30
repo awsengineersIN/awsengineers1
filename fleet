@@ -1,0 +1,154 @@
+pipeline {
+    agent any
+
+    parameters {
+        string(name: 'FLEET_NAME', defaultValue: 'my-fleet', description: 'AppStream Fleet Name')
+        string(name: 'STACK_NAME', defaultValue: 'my-stack', description: 'AppStream Stack Name')
+        booleanParam(name: 'STOP_FLEET', defaultValue: true, description: 'Stop fleet before image update')
+    }
+
+    environment {
+        REGION = 'us-east-1' // Update as needed
+    }
+
+    stages {
+
+        stage('Check Initial Fleet Status') {
+            steps {
+                echo "Checking current state of fleet: ${params.FLEET_NAME}"
+                sh """
+                aws appstream describe-fleets --names ${params.FLEET_NAME} --region $REGION \\
+                    --query "Fleets[0].{Name:Name, State:State, ImageName:ImageName}" --output table
+                """
+            }
+        }
+
+        stage('Stop Fleet if Required') {
+            when {
+                expression { params.STOP_FLEET == true }
+            }
+            steps {
+                script {
+                    echo "Stopping fleet: ${params.FLEET_NAME} and waiting until it's stopped..."
+                    sh "aws appstream stop-fleet --name ${params.FLEET_NAME} --region $REGION"
+                    timeout(time: 10, unit: 'MINUTES') {
+                        waitUntil {
+                            def state = sh(script: """
+                                aws appstream describe-fleets --names ${params.FLEET_NAME} --region $REGION --query "Fleets[0].State" --output text
+                            """, returnStdout: true).trim()
+                            echo "Current fleet state: ${state}"
+                            return state == "STOPPED"
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('Create Image Builder from Fleet') {
+            steps {
+                echo "Creating image builder..."
+                sh """
+                aws appstream create-image-builder --name temp-image-builder-${params.FLEET_NAME} \\
+                    --instance-type stream.standard.medium \\
+                    --image-name \$(aws appstream describe-fleets --names ${params.FLEET_NAME} --region $REGION --query "Fleets[0].ImageName" --output text) \\
+                    --region $REGION
+                """
+            }
+        }
+
+        stage('Wait for Image Builder Ready') {
+            steps {
+                script {
+                    echo "Waiting for image builder to be in RUNNING state..."
+                    timeout(time: 15, unit: 'MINUTES') {
+                        waitUntil {
+                            def state = sh(script: """
+                                aws appstream describe-image-builders --names temp-image-builder-${params.FLEET_NAME} --region $REGION --query "ImageBuilders[0].State" --output text
+                            """, returnStdout: true).trim()
+                            echo "Image builder state: ${state}"
+                            return state == "RUNNING"
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('Start Image Creation') {
+            steps {
+                echo "Starting image creation..."
+                script {
+                    def timestamp = sh(script: "date +%Y%m%d%H%M%S", returnStdout: true).trim()
+                    env.NEW_IMAGE_NAME = "image-${params.FLEET_NAME}-${timestamp}"
+
+                    sh """
+                    aws appstream create-image --name $NEW_IMAGE_NAME \\
+                        --image-builder-name temp-image-builder-${params.FLEET_NAME} --region $REGION
+                    """
+                }
+            }
+        }
+
+        stage('Wait for Image Creation') {
+            steps {
+                script {
+                    echo "Waiting for image creation to complete..."
+                    timeout(time: 30, unit: 'MINUTES') {
+                        waitUntil {
+                            def state = sh(script: """
+                                aws appstream describe-images --names $NEW_IMAGE_NAME --region $REGION --query "Images[0].State" --output text
+                            """, returnStdout: true).trim()
+                            echo "Image state: ${state}"
+                            return state == "AVAILABLE"
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('Delete Temp Image Builder') {
+            steps {
+                echo "Deleting temporary image builder..."
+                sh """
+                aws appstream delete-image-builder --name temp-image-builder-${params.FLEET_NAME} --region $REGION
+                """
+            }
+        }
+
+        stage('Update Fleet Image') {
+            steps {
+                echo "Updating fleet image to $NEW_IMAGE_NAME"
+                sh """
+                aws appstream update-fleet --name ${params.FLEET_NAME} --image-name $NEW_IMAGE_NAME --region $REGION
+                """
+            }
+        }
+
+        stage('Start Fleet and Wait') {
+            steps {
+                script {
+                    echo "Starting fleet: ${params.FLEET_NAME} and waiting until it's running..."
+                    sh "aws appstream start-fleet --name ${params.FLEET_NAME} --region $REGION"
+                    timeout(time: 15, unit: 'MINUTES') {
+                        waitUntil {
+                            def state = sh(script: """
+                                aws appstream describe-fleets --names ${params.FLEET_NAME} --region $REGION --query "Fleets[0].State" --output text
+                            """, returnStdout: true).trim()
+                            echo "Current fleet state: ${state}"
+                            return state == "RUNNING"
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('Final Status') {
+            steps {
+                echo "Fleet has been updated and started. New image name: $NEW_IMAGE_NAME"
+                sh """
+                aws appstream describe-fleets --names ${params.FLEET_NAME} --region $REGION \\
+                    --query "Fleets[0].{Name:Name, State:State, ImageName:ImageName}" --output table
+                """
+            }
+        }
+    }
+}
