@@ -1,0 +1,6 @@
+if isinstance(email_input, str):
+        recipients = [email.strip() for email in email_input.split(',') if email.strip()]
+    elif isinstance(email_input, list):
+        recipients = [email.strip() for email in email_input if email.strip()]
+    else:
+        raise ValueError("Email parameter must be a string or list")
